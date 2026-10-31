@@ -1,4 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Where is crime moving? London</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #1f2937; }
+  #map { position: absolute; inset: 0; }
+  .card { background: rgba(255,255,255,0.96); border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.25); }
+  #title { position: absolute; top: 10px; left: 10px; right: 56px; max-width: 420px; padding: 10px 14px; }
+  #title h1 { font-size: 17px; margin: 0 0 2px; }
+  #title p { font-size: 12.5px; margin: 0; color: #4b5563; line-height: 1.35; }
+  #panel { position: absolute; left: 10px; right: 10px; bottom: 24px; max-width: 560px; padding: 12px 14px; }
+  #yearRow { display: flex; align-items: center; gap: 10px; }
+  #play { width: 42px; height: 42px; border-radius: 50%; border: 0; background: #1f2937; color: #fff; font-size: 16px; cursor: pointer; flex: none; }
+  #yearBox { flex: 1; min-width: 0; }
+  #yearLabel { font-weight: 700; font-size: 15px; }
+  #slider { width: 100%; margin: 6px 0 0; }
+  #toggles { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .tog { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #d1d5db; background: #fff; border-radius: 999px; padding: 6px 11px; font-size: 13px; cursor: pointer; min-height: 34px; }
+  .tog.off { opacity: 0.4; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; border: 1px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,0.25); }
+  #changed { margin-top: 10px; font-size: 13px; line-height: 1.4; }
+  #changed b { font-weight: 700; }
+  #hint { margin-top: 6px; font-size: 11.5px; color: #6b7280; line-height: 1.35; }
+  #credit { position: absolute; left: 10px; bottom: 4px; font-size: 10.5px; color: #374151; background: rgba(255,255,255,0.8); padding: 1px 6px; border-radius: 4px; }
+  #error { position: absolute; top: 90px; left: 10px; right: 10px; max-width: 520px; padding: 12px 14px; background: #fee2e2; color: #991b1b; border-radius: 8px; font-size: 14px; display: none; }
+  .maplibregl-popup-content { font-size: 13px; line-height: 1.4; padding: 10px 12px; }
+  .maplibregl-popup-content h3 { margin: 0 0 4px; font-size: 14px; }
+  @media (max-width: 480px) { #title h1 { font-size: 15px; } #panel { bottom: 22px; } }
+</style>
+</head>
+<body>
+<div id="map"></div>
 
+<div id="title" class="card">
+  <h1>Where is crime moving?</h1>
+  <p>Is crime spreading into areas that used to be quiet? Press play to watch London's crime hotspots appear, stay and fade.</p>
+</div>
 
+<div id="error"></div>
 
+<div id="panel" class="card">
+  <div id="yearRow">
+    <button id="play" aria-label="Play or pause">&#9654;</button>
+    <div id="yearBox">
+      <div id="yearLabel">Loading&hellip;</div>
+      <input id="slider" type="range" min="0" max="2" step="1" value="0" aria-label="Year">
+    </div>
+  </div>
+  <div id="toggles"></div>
+  <div id="changed"></div>
+  <div id="hint">Circle size = number of crimes. Tap a circle for details. Police locations are anonymised, so this shows areas, not exact streets.</div>
+</div>
 
+<div id="credit">Contains public sector information licensed under the Open Government Licence v3.0. Source: data.police.uk</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="config.js"></script>
+<script>
+(function () {
+  var CFG = window.APP_CONFIG || {};
+  var YEARS = [
+    { id: "Year1", label: "Sep 2023 \u2013 Aug 2024" },
+    { id: "Year2", label: "Sep 2024 \u2013 Aug 2025" },
+    { id: "Year3", label: "Sep 2025 \u2013 Aug 2026" }
+  ];
+  var COLORS = { new: "#dc2626", established: "#f28c28", faded: "#9ca3af", baseline: "#f28c28" };
+  var visible = { new: true, established: true, faded: true };
+  var data = {};
+  var current = 0;
+  var timer = null;
+  var map;
+
+  function showError(msg) {
+    var e = document.getElementById("error");
+    e.textContent = msg;
+    e.style.display = "block";
+  }
+
+  if (!CFG.apiKey || CFG.apiKey.indexOf("PASTE") === 0 || !CFG.region) {
+    showError("config.js is missing or incomplete. It must set apiKey and region (see config.example.js).");
+    return;
+  }
+
+  var styleUrl = "https://maps.geo." + CFG.region + ".amazonaws.com/v2/styles/" +
+    (CFG.style || "Standard") + "/descriptor?color-scheme=Light&key=" + encodeURIComponent(CFG.apiKey);
+
+  map = new maplibregl.Map({
+    container: "map",
+    style: styleUrl,
+    center: [-0.1276, 51.5072],
+    zoom: 9.4,
+    attributionControl: { compact: true }
+  });
+  map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+  map.on("error", function (e) {
+    if (e && e.error && /40[13]/.test(String(e.error.message || e.error.status || ""))) {
+      showError("The base map was refused (403). Check the API key, its region, and its allowed referrer.");
+    }
+  });
+
+  function getJSON(url) {
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error(url + " returned " + r.status);
+      return r.json();
+    });
+  }
+
+  var dataReady = Promise.all(YEARS.map(function (y) {
+    return getJSON("data/hotspots_" + y.id + ".geojson").then(function (g) { data[y.id] = g; });
+  }));
+  var boroughsReady = getJSON("data/boroughs.geojson").catch(function () { return null; });
+  var mapReady = new Promise(function (res) { map.on("load", res); });
+
+  Promise.all([dataReady, boroughsReady, mapReady]).then(function (r) {
+    setup(r[1]);
+  }).catch(function (err) {
+    showError("Could not load the data files: " + err.message);
+  });
+
+  var sizeExpr = ["min", 32, ["max", 5, ["+", 4, ["/", ["sqrt", ["coalesce", ["get", "crimes"], ["get", "prev_crimes"], 100]], 4]]]];
+
+  function setup(boroughs) {
+    if (boroughs) {
+      map.addSource("boroughs", { type: "geojson", data: boroughs });
+      map.addLayer({
+        id: "boroughs-line", type: "line", source: "boroughs",
+        paint: { "line-color": "#374151", "line-width": 1, "line-opacity": 0.55 }
+      });
+    }
+    map.addSource("hotspots", { type: "geojson", data: data[YEARS[0].id] });
+    map.addLayer({
+      id: "hotspots", type: "circle", source: "hotspots",
+      layout: {
+        "circle-sort-key": ["match", ["get", "status"], "faded", 0, "established", 1, "baseline", 1, "new", 2, 1]
+      },
+      paint: {
+        "circle-color": ["match", ["get", "status"],
+          "new", COLORS.new, "faded", COLORS.faded, COLORS.established],
+        "circle-radius": ["interpolate", ["linear"], ["zoom"],
+          8, ["*", 0.6, sizeExpr], 13, ["*", 1.5, sizeExpr]],
+        "circle-opacity": 0.72,
+        "circle-stroke-color": "#ffffff",
+        "circle-stroke-width": 1
+      }
+    });
+
+    map.on("click", "hotspots", function (e) {
+      var p = e.features[0].properties;
+      new maplibregl.Popup({ maxWidth: "260px" })
+        .setLngLat(e.features[0].geometry.coordinates.slice())
+        .setHTML(popupHtml(p))
+        .addTo(map);
+    });
+    map.on("mouseenter", "hotspots", function () { map.getCanvas().style.cursor = "pointer"; });
+    map.on("mouseleave", "hotspots", function () { map.getCanvas().style.cursor = ""; });
+
+    buildToggles();
+    document.getElementById("slider").addEventListener("input", function (ev) {
+      stop();
+      setYear(parseInt(ev.target.value, 10));
+    });
+    document.getElementById("play").addEventListener("click", function () {
+      if (timer) { stop(); } else { play(); }
+    });
+    setYear(0);
+  }
+
+  function num(v) { return (v === null || v === undefined || v === "null" || v === "") ? null : Number(v); }
+  function fmt(n) { return Number(n).toLocaleString("en-GB"); }
+
+  function popupHtml(p) {
+    var status = p.status;
+    var crimes = num(p.crimes), prev = num(p.prev_crimes), pct = num(p.change_pct);
+    var h = "<h3>" + (p.borough || "London") + "</h3>";
+    if (status === "new") {
+      h += "<b style='color:#dc2626'>New hotspot</b><br>Not a hotspot last year.<br>" + fmt(crimes) + " crimes this year.";
+    } else if (status === "faded") {
+      h += "<b style='color:#6b7280'>Faded hotspot</b><br>Was a hotspot last year (" + fmt(prev) + " crimes), but not this year.";
+    } else if (status === "established") {
+      h += "<b style='color:#c2610a'>Established hotspot</b><br>" + fmt(crimes) + " crimes this year";
+      if (prev !== null) h += " (" + fmt(prev) + " last year)";
+      h += ".";
+      if (pct !== null) h += "<br>Change: " + (pct > 0 ? "+" : "") + pct.toFixed(1) + "%";
+    } else {
+      h += "<b style='color:#c2610a'>Hotspot</b> (first year, nothing to compare with)<br>" + fmt(crimes) + " crimes.";
+    }
+    return h;
+  }
+
+  function buildToggles() {
+    var box = document.getElementById("toggles");
+    [["new", "New"], ["established", "Established"], ["faded", "Faded"]].forEach(function (s) {
+      var b = document.createElement("button");
+      b.className = "tog";
+      b.innerHTML = "<span class='dot' style='background:" + COLORS[s[0]] + "'></span>" + s[1];
+      b.addEventListener("click", function () {
+        visible[s[0]] = !visible[s[0]];
+        b.classList.toggle("off", !visible[s[0]]);
+        applyFilter();
+      });
+      box.appendChild(b);
+    });
+  }
+
+  function applyFilter() {
+    var allowed = [];
+    if (visible.new) allowed.push("new");
+    if (visible.established) { allowed.push("established"); allowed.push("baseline"); }
+    if (visible.faded) allowed.push("faded");
+    map.setFilter("hotspots", ["in", ["get", "status"], ["literal", allowed]]);
+  }
+
+  function setYear(i) {
+    current = i;
+    var y = YEARS[i];
+    map.getSource("hotspots").setData(data[y.id]);
+    document.getElementById("slider").value = i;
+    document.getElementById("yearLabel").textContent = y.label;
+    applyFilter();
+    summary(y.id);
+  }
+
+  function summary(id) {
+    var counts = { new: 0, established: 0, faded: 0, baseline: 0 };
+    data[id].features.forEach(function (f) {
+      var s = f.properties.status;
+      if (counts[s] !== undefined) counts[s]++;
+    });
+    var total = data[id].features.length;
+    var el = document.getElementById("changed");
+    if (counts.baseline > 0) {
+      el.innerHTML = "<b>What changed:</b> this is the starting year, with " + total +
+        " hotspots across London. Press play to see what appears, stays and fades.";
+    } else {
+      el.innerHTML = "<b>What changed:</b> of " + (counts.new + counts.established) +
+        " hotspots this year, <b style='color:#dc2626'>" + counts.new + " are new</b>, " +
+        "<b style='color:#c2610a'>" + counts.established + " stayed</b>, and " +
+        "<b style='color:#6b7280'>" + counts.faded + " faded</b> from last year.";
+    }
+  }
+
+  function play() {
+    document.getElementById("play").innerHTML = "&#10074;&#10074;";
+    if (current >= YEARS.length - 1) setYear(0);
+    timer = setInterval(function () {
+      if (current >= YEARS.length - 1) { stop(); return; }
+      setYear(current + 1);
+    }, 2500);
+  }
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+    document.getElementById("play").innerHTML = "&#9654;";
+  }
+})();
+</script>
+</body>
+</html>
