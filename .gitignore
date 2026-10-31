@@ -221,7 +221,8 @@ __marimo__/
 
 .idea/
 .venv/
-data/raw/
+data/raw/*
+!data/raw/README.md
 web/config.js
 __pycache__/
 .ipynb_checkpoints/
