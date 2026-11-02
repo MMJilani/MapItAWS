@@ -32,7 +32,7 @@ LONDON = [
 
 #Load
 def load_crimes():
-    files = sorted(RAW_DIR.glob("**/*-street.csv"))      # skips the -outcomes.csv files
+    files = sorted(RAW_DIR.glob("**/*-street.csv"))
     if not files:
         raise SystemExit(f"No *-street.csv files found in {RAW_DIR}")
 
@@ -63,8 +63,7 @@ def clean(crimes):
 
 
 def add_year_groups(crimes):
-    # Three 12-month blocks counting back from the newest month,
-    # e.g. latest = Aug 2026 -> Year3 starts Sep 2025, Year2 Sep 2024, Year1 Sep 2023
+    # Three 12-month blocks counting back from the newest month
     latest = crimes["Month"].max()
     year3_start = latest - pd.DateOffset(months=11)
     year2_start = latest - pd.DateOffset(months=23)
