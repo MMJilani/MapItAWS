@@ -10,9 +10,17 @@
 <body>
 <div id="map"></div>
 
-<div id="title" class="card">
+<div id="top" class="card">
   <h1>Where is crime moving?</h1>
   <p>Is crime spreading into areas that used to be quiet? Press play to watch London's crime hotspots appear, stay and fade.</p>
+  <form id="searchForm" role="search">
+    <input id="q" type="search" placeholder="Search an address or postcode" aria-label="Search a London address or postcode" autocomplete="off">
+    <button id="go" type="submit">Go</button>
+  </form>
+  <select id="borough" aria-label="Zoom to a borough">
+    <option value="">All of London</option>
+  </select>
+  <div id="focus" aria-live="polite"></div>
 </div>
 
 <div id="error"></div>
@@ -27,6 +35,10 @@
   </div>
   <div id="toggles"></div>
   <div id="changed"></div>
+  <details id="newBox">
+    <summary>Biggest new hotspots <span id="newScope"></span></summary>
+    <ol id="newList"></ol>
+  </details>
   <div id="hint">Circle size = number of crimes. Tap a circle for details. Police locations are anonymised, so this shows areas, not exact streets.</div>
 </div>
 
@@ -38,19 +50,34 @@
 (function () {
   var CFG = window.APP_CONFIG || {};
   var YEARS = [
-    { id: "Year1", label: "Sep 2023 \u2013 Aug 2024" },
-    { id: "Year2", label: "Sep 2024 \u2013 Aug 2025" },
-    { id: "Year3", label: "Sep 2025 \u2013 Aug 2026" }
+    { id: "Year1", label: "Sep 2023 – Aug 2024" },
+    { id: "Year2", label: "Sep 2024 – Aug 2025" },
+    { id: "Year3", label: "Sep 2025 – Aug 2026" }
   ];
   var COLORS = { new: "#dc2626", established: "#f28c28", faded: "#9ca3af", baseline: "#f28c28" };
+  var LONDON = [[-0.52, 51.28], [0.34, 51.70]];   // rough bounding box of Greater London
+  var RADIUS_KM = 1.5;                             // "nearby" radius for address search
   var visible = { new: true, established: true, faded: true };
   var data = {};
+  var boroughs = [];      // { name, geom, bbox }
+  var focus = null;       // null | { type: "borough", name, b } | { type: "place", lng, lat, label }
+  var marker = null;
+  var popup = null;
   var current = 0;
   var timer = null;
   var map;
 
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function num(v) { return (v === null || v === undefined || v === "null" || v === "") ? null : Number(v); }
+  function fmt(n) { return Number(n).toLocaleString("en-GB"); }
+
   function showError(msg) {
-    var e = document.getElementById("error");
+    var e = $("error");
     e.textContent = msg;
     e.style.display = "block";
   }
@@ -98,14 +125,91 @@
 
   var sizeExpr = ["min", 32, ["max", 5, ["+", 4, ["/", ["sqrt", ["coalesce", ["get", "crimes"], ["get", "prev_crimes"], 100]], 4]]]];
 
-  function setup(boroughs) {
-    if (boroughs) {
-      map.addSource("boroughs", { type: "geojson", data: boroughs });
+  /* ---------- geometry helpers ---------- */
+  function eachPoint(c, fn) {
+    if (typeof c[0] === "number") { fn(c); return; }
+    for (var i = 0; i < c.length; i++) eachPoint(c[i], fn);
+  }
+  function bboxOf(geom) {
+    var b = [Infinity, Infinity, -Infinity, -Infinity];
+    eachPoint(geom.coordinates, function (p) {
+      if (p[0] < b[0]) b[0] = p[0];
+      if (p[1] < b[1]) b[1] = p[1];
+      if (p[0] > b[2]) b[2] = p[0];
+      if (p[1] > b[3]) b[3] = p[1];
+    });
+    return b;
+  }
+  function inRing(x, y, ring) {
+    var inside = false;
+    for (var i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      var xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+    }
+    return inside;
+  }
+  function inPoly(x, y, rings) {
+    var c = false;
+    for (var i = 0; i < rings.length; i++) if (inRing(x, y, rings[i])) c = !c;
+    return c;
+  }
+  function inBorough(pt, b) {
+    var x = pt[0], y = pt[1];
+    if (x < b.bbox[0] || x > b.bbox[2] || y < b.bbox[1] || y > b.bbox[3]) return false;
+    if (b.geom.type === "Polygon") return inPoly(x, y, b.geom.coordinates);
+    if (b.geom.type === "MultiPolygon") {
+      for (var k = 0; k < b.geom.coordinates.length; k++) {
+        if (inPoly(x, y, b.geom.coordinates[k])) return true;
+      }
+    }
+    return false;
+  }
+  function distKm(a, b) {
+    var R = 6371, rad = Math.PI / 180;
+    var dLat = (b[1] - a[1]) * rad, dLon = (b[0] - a[0]) * rad;
+    var h = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(a[1] * rad) * Math.cos(b[1] * rad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+
+  /* keep the camera clear of the two cards */
+  function pad() {
+    if (window.innerWidth > 700) return { top: 40, bottom: 40, left: 440, right: 70 };
+    var t = $("top").offsetHeight + 20, b = $("panel").offsetHeight + 40, h = window.innerHeight;
+    if (t + b > h * 0.8) { var k = h * 0.8 / (t + b); t *= k; b *= k; }
+    return { top: t, bottom: b, left: 20, right: 60 };
+  }
+
+  /* ---------- setup ---------- */
+  function setup(boroughsGeo) {
+    if (boroughsGeo) {
+      map.addSource("boroughs", { type: "geojson", data: boroughsGeo });
       map.addLayer({
         id: "boroughs-line", type: "line", source: "boroughs",
         paint: { "line-color": "#374151", "line-width": 1, "line-opacity": 0.55 }
       });
+      map.addLayer({
+        id: "borough-highlight", type: "line", source: "boroughs",
+        filter: ["==", ["get", "name"], ""],
+        paint: { "line-color": "#2563eb", "line-width": 3 }
+      });
+      boroughsGeo.features.forEach(function (f) {
+        if (f.geometry && f.properties && f.properties.name) {
+          boroughs.push({ name: f.properties.name, geom: f.geometry, bbox: bboxOf(f.geometry) });
+        }
+      });
+      boroughs.sort(function (a, b) { return a.name.localeCompare(b.name); });
+      var sel = $("borough");
+      boroughs.forEach(function (b) {
+        var o = document.createElement("option");
+        o.value = b.name;
+        o.textContent = b.name;
+        sel.appendChild(o);
+      });
+    } else {
+      $("borough").style.display = "none";
     }
+
     map.addSource("hotspots", { type: "geojson", data: data[YEARS[0].id] });
     map.addLayer({
       id: "hotspots", type: "circle", source: "hotspots",
@@ -124,33 +228,42 @@
     });
 
     map.on("click", "hotspots", function (e) {
-      var p = e.features[0].properties;
-      new maplibregl.Popup({ maxWidth: "260px" })
-        .setLngLat(e.features[0].geometry.coordinates.slice())
-        .setHTML(popupHtml(p))
-        .addTo(map);
+      var f = e.features[0];
+      openPopup(f.properties, f.geometry.coordinates.slice());
     });
     map.on("mouseenter", "hotspots", function () { map.getCanvas().style.cursor = "pointer"; });
     map.on("mouseleave", "hotspots", function () { map.getCanvas().style.cursor = ""; });
 
     buildToggles();
-    document.getElementById("slider").addEventListener("input", function (ev) {
+    $("slider").addEventListener("input", function (ev) {
       stop();
       setYear(parseInt(ev.target.value, 10));
     });
-    document.getElementById("play").addEventListener("click", function () {
+    $("play").addEventListener("click", function () {
       if (timer) { stop(); } else { play(); }
     });
+    $("borough").addEventListener("change", onBoroughChange);
+    $("searchForm").addEventListener("submit", onSearch);
+    $("focus").addEventListener("click", function (e) {
+      if (e.target && e.target.id === "clearFocus") resetFocus();
+    });
+    $("newBox").open = window.innerWidth > 700 && window.innerHeight > 720;
     setYear(0);
   }
 
-  function num(v) { return (v === null || v === undefined || v === "null" || v === "") ? null : Number(v); }
-  function fmt(n) { return Number(n).toLocaleString("en-GB"); }
+  /* ---------- popups ---------- */
+  function openPopup(p, coords) {
+    if (popup) popup.remove();
+    popup = new maplibregl.Popup({ maxWidth: "260px" })
+      .setLngLat(coords)
+      .setHTML(popupHtml(p))
+      .addTo(map);
+  }
 
   function popupHtml(p) {
     var status = p.status;
     var crimes = num(p.crimes), prev = num(p.prev_crimes), pct = num(p.change_pct);
-    var h = "<h3>" + (p.borough || "London") + "</h3>";
+    var h = "<h3>" + esc(p.borough || "London") + "</h3>";
     if (status === "new") {
       h += "<b style='color:#dc2626'>New hotspot</b><br>Not a hotspot last year.<br>" + fmt(crimes) + " crimes this year.";
     } else if (status === "faded") {
@@ -166,8 +279,9 @@
     return h;
   }
 
+  /* ---------- legend buttons, year, London-wide summary ---------- */
   function buildToggles() {
-    var box = document.getElementById("toggles");
+    var box = $("toggles");
     [["new", "New"], ["established", "Established"], ["faded", "Faded"]].forEach(function (s) {
       var b = document.createElement("button");
       b.className = "tog";
@@ -189,24 +303,31 @@
     map.setFilter("hotspots", ["in", ["get", "status"], ["literal", allowed]]);
   }
 
+  function count(list) {
+    var c = { new: 0, established: 0, faded: 0, baseline: 0 };
+    list.forEach(function (f) {
+      var s = f.properties.status;
+      if (c[s] !== undefined) c[s]++;
+    });
+    return c;
+  }
+
   function setYear(i) {
     current = i;
     var y = YEARS[i];
     map.getSource("hotspots").setData(data[y.id]);
-    document.getElementById("slider").value = i;
-    document.getElementById("yearLabel").textContent = y.label;
+    $("slider").value = i;
+    $("yearLabel").textContent = y.label;
     applyFilter();
     summary(y.id);
+    updateFocus();
+    renderNew();
   }
 
   function summary(id) {
-    var counts = { new: 0, established: 0, faded: 0, baseline: 0 };
-    data[id].features.forEach(function (f) {
-      var s = f.properties.status;
-      if (counts[s] !== undefined) counts[s]++;
-    });
+    var counts = count(data[id].features);
     var total = data[id].features.length;
-    var el = document.getElementById("changed");
+    var el = $("changed");
     if (counts.baseline > 0) {
       el.innerHTML = "<b>What changed:</b> this is the starting year, with " + total +
         " hotspots across London. Press play to see what appears, stays and fades.";
@@ -219,7 +340,7 @@
   }
 
   function play() {
-    document.getElementById("play").innerHTML = "&#10074;&#10074;";
+    $("play").innerHTML = "&#10074;&#10074;";
     if (current >= YEARS.length - 1) setYear(0);
     timer = setInterval(function () {
       if (current >= YEARS.length - 1) { stop(); return; }
@@ -228,7 +349,171 @@
   }
   function stop() {
     if (timer) { clearInterval(timer); timer = null; }
-    document.getElementById("play").innerHTML = "&#9654;";
+    $("play").innerHTML = "&#9654;";
+  }
+
+  /* ---------- focus: a borough or a searched place ---------- */
+  function inFocus(f) {
+    if (!focus) return true;
+    var pt = f.geometry.coordinates;
+    if (focus.type === "borough") return inBorough(pt, focus.b);
+    return distKm(pt, [focus.lng, focus.lat]) <= RADIUS_KM;
+  }
+
+  function highlight(name) {
+    if (map.getLayer("borough-highlight")) {
+      map.setFilter("borough-highlight", ["==", ["get", "name"], name || ""]);
+    }
+  }
+
+  function removeMarker() {
+    if (marker) { marker.remove(); marker = null; }
+  }
+
+  function updateFocus() {
+    if (!focus) return;
+    var list = data[YEARS[current].id].features.filter(inFocus);
+    var c = count(list);
+    var now = c.new + c.established + c.baseline;
+    var title = focus.type === "borough" ? focus.name : "Within " + RADIUS_KM + " km of " + focus.label;
+    var body;
+    if (c.baseline > 0) {
+      body = now + " hotspots here in the starting year.";
+    } else if (now === 0 && c.faded === 0) {
+      body = "No hotspots here this year.";
+    } else {
+      body = now + " hotspots this year: <b style='color:#dc2626'>" + c.new + " new</b>, " +
+        "<b style='color:#c2610a'>" + c.established + " established</b>. " +
+        "<b style='color:#6b7280'>" + c.faded + " faded</b> from last year.";
+    }
+    $("focus").innerHTML = "<b>" + esc(title) + "</b><button type='button' id='clearFocus'>Clear</button><br>" + body;
+  }
+
+  function setMessage(text) {
+    focus = null;
+    removeMarker();
+    highlight("");
+    $("borough").value = "";
+    $("focus").textContent = text;
+    renderNew();
+  }
+
+  function resetFocus() {
+    focus = null;
+    removeMarker();
+    highlight("");
+    $("borough").value = "";
+    $("q").value = "";
+    $("focus").innerHTML = "";
+    renderNew();
+    map.fitBounds(LONDON, { padding: pad(), maxZoom: 10.5, duration: 900 });
+  }
+
+  function onBoroughChange() {
+    var name = $("borough").value;
+    removeMarker();
+    $("q").value = "";
+    if (!name) { resetFocus(); return; }
+    var b = boroughs.filter(function (x) { return x.name === name; })[0];
+    if (!b) return;
+    focus = { type: "borough", name: name, b: b };
+    highlight(name);
+    updateFocus();
+    renderNew();
+    map.fitBounds([[b.bbox[0], b.bbox[1]], [b.bbox[2], b.bbox[3]]],
+      { padding: pad(), maxZoom: 13, duration: 900 });
+  }
+
+  /* ---------- address search (Amazon Location Places, SearchText) ---------- */
+  function placesCall(body) {
+    var url = "https://places.geo." + CFG.region + ".amazonaws.com/v2/search-text?key=" + encodeURIComponent(CFG.apiKey);
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (!r.ok) { var e = new Error("HTTP " + r.status); e.status = r.status; throw e; }
+      return r.json();
+    });
+  }
+
+  function searchPlace(q) {
+    var base = { QueryText: q, MaxResults: 8, BiasPosition: [-0.1276, 51.5072] };
+    var withCountry = { QueryText: q, MaxResults: 8, BiasPosition: [-0.1276, 51.5072], Filter: { IncludeCountries: ["GBR"] } };
+    return placesCall(withCountry).catch(function (e) {
+      if (e.status === 400) return placesCall(base);   // retry without the filter
+      throw e;
+    }).then(function (j) {
+      var items = (j.ResultItems || []).filter(function (it) {
+        var p = it.Position;
+        return p && p[0] >= LONDON[0][0] && p[0] <= LONDON[1][0] && p[1] >= LONDON[0][1] && p[1] <= LONDON[1][1];
+      });
+      return items[0] || null;
+    });
+  }
+
+  function onSearch(ev) {
+    ev.preventDefault();
+    var q = $("q").value.trim();
+    if (!q) return;
+    $("q").blur();
+    $("focus").textContent = "Searching…";
+    searchPlace(q).then(function (item) {
+      if (!item) { setMessage("No match in London for “" + q + "”. Try a postcode or a street name."); return; }
+      var label = item.Title || (item.Address && item.Address.Label) || q;
+      var pos = item.Position;
+      $("borough").value = "";
+      highlight("");
+      removeMarker();
+      marker = new maplibregl.Marker({ color: "#2563eb" }).setLngLat(pos).addTo(map);
+      focus = { type: "place", lng: pos[0], lat: pos[1], label: label };
+      updateFocus();
+      renderNew();
+      map.flyTo({ center: pos, zoom: 13.5, padding: pad(), essential: true });
+    }).catch(function (err) {
+      if (err.status === 403) {
+        setMessage("Search was refused (403). The API key must allow Places SearchText from this website address.");
+      } else {
+        setMessage("Search failed. Check your connection and try again.");
+      }
+    });
+  }
+
+  /* ---------- biggest new hotspots ---------- */
+  function renderNew() {
+    var id = YEARS[current].id, ul = $("newList");
+    $("newScope").textContent = "(" + (!focus ? "London" : focus.type === "borough" ? focus.name : "near " + focus.label) + ")";
+    ul.innerHTML = "";
+    function note(t) {
+      var li = document.createElement("li");
+      li.className = "note";
+      li.textContent = t;
+      ul.appendChild(li);
+    }
+    var feats = data[id].features;
+    if (feats.some(function (f) { return f.properties.status === "baseline"; })) {
+      note("This is the starting year. Move the slider to a later year to see new hotspots.");
+      return;
+    }
+    var list = feats.filter(function (f) { return f.properties.status === "new" && inFocus(f); });
+    list.sort(function (a, b) { return (num(b.properties.crimes) || 0) - (num(a.properties.crimes) || 0); });
+    list = list.slice(0, 5);
+    if (!list.length) { note("No new hotspots here this year."); return; }
+    list.forEach(function (f, i) {
+      var li = document.createElement("li");
+      var b = document.createElement("button");
+      b.type = "button";
+      b.innerHTML = "<span class='rank'>" + (i + 1) + "</span><span class='nm'>" +
+        esc(f.properties.borough || "London") + "</span><span class='ct'>" +
+        fmt(num(f.properties.crimes) || 0) + " crimes</span>";
+      b.addEventListener("click", function () {
+        var c = f.geometry.coordinates.slice();
+        map.flyTo({ center: c, zoom: 14, padding: pad(), essential: true });
+        openPopup(f.properties, c);
+      });
+      li.appendChild(b);
+      ul.appendChild(li);
+    });
   }
 })();
 </script>
