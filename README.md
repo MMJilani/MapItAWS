@@ -1,7 +1,6 @@
 # Where is crime moving? London
 
 **Is crime spreading into areas that used to be quiet?** This map shows London's crime hotspots over three years. Press play to watch them appear, stay and fade.
-
 **Live map:** <[Map Link](http://amzn-s3-bucket-mapit.s3-website.eu-north-1.amazonaws.com/)>
 **Video:** <Video Link>()
 
