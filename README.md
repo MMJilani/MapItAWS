@@ -2,7 +2,7 @@
 
 **Is crime spreading into areas that used to be quiet?** This map shows London's crime hotspots over three years. Press play to watch them appear, stay and fade.
 **Live map:** <[Map Link](http://amzn-s3-bucket-mapit.s3-website.eu-north-1.amazonaws.com/)>
-**Video:** <Video Link>(https://www.youtube.com/watch?v=db1QYh95TF4)
+**Video:** <Video Link>(https://www.youtube.com/watch?v=db1QYh95TF4)>
 
 ## What the map reveals
 - **Total crime barely changed:** 1,139,469 crimes in Sep 2023–Aug 2024 vs 1,125,245 in Sep 2025–Aug 2026 (about −1%).
